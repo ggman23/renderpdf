@@ -1,18 +1,17 @@
-# app.py — Render (Flask + CORS + PyMuPDF) v2.4
+# app.py — Render (Flask + CORS + PyMuPDF) v2.5
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import base64, io, re
 import fitz  # PyMuPDF
 
-VERSION = "v2.4"
+VERSION = "v2.5"
 
 app = Flask(__name__, static_folder="static", static_url_path="/")
 CORS(app)
 
-# assez large: lettres, accents, apostrophes/traits d’union, éventuellement chiffres
-LINE_RX = re.compile(r"[A-Za-zÀ-ÿ0-9'’\- ]{2,}")
-
+# ---------- Utils ----------
 def xref_to_dataurl(doc, xref):
+    """Extraction robuste d'une image à partir d'un xref (extract_image puis Pixmap fallback)."""
     try:
         meta = doc.extract_image(xref)
         if meta and "image" in meta:
@@ -34,11 +33,26 @@ def xref_to_dataurl(doc, xref):
     except Exception:
         return None
 
+def rect_to_dataurl(page, rect, scale=2.0):
+    """
+    Rendre un clip rectangulaire de la page en PNG base64.
+    scale=2 => ~144 DPI ; ajuste si besoin (plus haut = plus net, plus lourd).
+    """
+    mat = fitz.Matrix(scale, scale)
+    clip = fitz.Rect(rect).intersect(page.rect)
+    if clip.is_empty:
+        return None
+    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+    buf = io.BytesIO(pix.tobytes("png"))
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return "data:image/png;base64," + b64
+
 def overlap_ratio(a0, a1, b0, b1):
     inter = max(0.0, min(a1, b1) - max(a0, b0))
     width = max(a1 - a0, 1e-6)
     return inter / width
 
+# ---------- Routes basiques ----------
 @app.get("/")
 def index():
     try:
@@ -50,7 +64,7 @@ def index():
 def healthz():
     return jsonify({"ok": True, "version": VERSION})
 
-# ----- extraction simple (inchangé) -----
+# ---------- Extraction simple (inchangé) ----------
 @app.route("/api/extract_images", methods=["GET", "POST", "OPTIONS"])
 def extract_images():
     if request.method == "OPTIONS":
@@ -92,7 +106,7 @@ def extract_images():
 
     return jsonify({"pages": pages_out, "debug": {"pages": len(doc), "total_images": total}, "version": VERSION})
 
-# ----- appariement image -> nom (avec groupement de lignes) -----
+# ---------- Appariement “classique” (peut rester à 0 si pas de texte vectoriel) ----------
 @app.route("/api/extract_pairs", methods=["GET", "POST", "OPTIONS"])
 def extract_pairs():
     if request.method == "OPTIONS":
@@ -109,14 +123,12 @@ def extract_pairs():
     except Exception as e:
         return jsonify({"error": f"cannot open pdf: {e}"}), 400
 
+    # Ici, on essaye via texte vectoriel (peut renvoyer 0 si PDF scanné)
     pairs_all, stats = [], []
-
     for page_index in range(len(doc)):
         page = doc[page_index]
-
-        # --- 1) lignes de texte brutes ---
         rd = page.get_text("rawdict")
-        raw_lines = []  # [{text, bbox}]
+        raw_lines = []
         for block in (rd.get("blocks") or []):
             if block.get("type") == 0:
                 for line in (block.get("lines") or []):
@@ -124,8 +136,6 @@ def extract_pairs():
                     for span in (line.get("spans") or []):
                         s = (span.get("text") or "").strip()
                         if not s:
-                            continue
-                        if not LINE_RX.search(s):
                             continue
                         parts.append(s)
                         bx0, by0, bx1, by1 = span.get("bbox") or [0, 0, 0, 0]
@@ -137,29 +147,6 @@ def extract_pairs():
                         txt = " ".join(parts).strip()
                         raw_lines.append({"text": txt, "bbox": (x0, y0, x1, y1)})
 
-        # --- 2) regroupement de lignes empilées (NOM + PRÉNOM) ---
-        raw_lines.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))  # tri par y puis x
-        grouped = []
-        for ln in raw_lines:
-            merged = False
-            # essaie de fusionner avec le dernier groupe si proche en Y et bon chevauchement horizontal
-            if grouped:
-                g = grouped[-1]
-                gx0, gy0, gx1, gy1 = g["bbox"]
-                lx0, ly0, lx1, ly1 = ln["bbox"]
-                # proximité verticale (petit saut entre lignes)
-                vgap = ly0 - gy1
-                # grille Pronote: on tolère ~2.5% de la hauteur page + 4px
-                vlimit = max(page.rect.height * 0.025, 4)
-                if vgap >= -2 and vgap <= vlimit and overlap_ratio(gx0, gx1, lx0, lx1) >= 0.4:
-                    # fusion
-                    g["text"] = (g["text"] + " " + ln["text"]).strip()
-                    g["bbox"] = (min(gx0, lx0), min(gy0, ly0), max(gx1, lx1), max(gy1, ly1))
-                    merged = True
-            if not merged:
-                grouped.append(dict(text=ln["text"], bbox=ln["bbox"]))
-
-        # --- 3) toutes les images + BBOX via get_image_rects ---
         seen, xrefs = set(), []
         for info in page.get_images(full=True):
             xr = info[0]
@@ -167,6 +154,7 @@ def extract_pairs():
                 seen.add(xr)
                 xrefs.append(xr)
 
+        # BBox via get_image_rects
         images_with_bbox = []
         for xr in xrefs:
             rects = page.get_image_rects(xr)
@@ -178,62 +166,11 @@ def extract_pairs():
             if dataurl:
                 images_with_bbox.append({"dataurl": dataurl, "bbox": bbox, "xref": xr})
 
-        # --- 4) appariement ---
+        # Pas d’appariement si pas de texte reconnu
         pairs_page = []
-        used = [False] * len(grouped)
-        dy_limit = max(page.rect.height * 0.09, 16)  # fenêtre verticale un peu plus large
-
-        for im in images_with_bbox:
-            ix0, iy0, ix1, iy1 = im["bbox"]
-            best_j, best_score = -1, 1e9
-
-            # a) candidats sous la photo avec chevauchement horizontal
-            for j, tl in enumerate(grouped):
-                if used[j]:
-                    continue
-                tx0, ty0, tx1, ty1 = tl["bbox"]
-                if ty0 < iy1:
-                    continue
-                dy = ty0 - iy1
-                if dy > dy_limit:
-                    continue
-                ov = overlap_ratio(ix0, ix1, tx0, tx1)
-                if ov < 0.22:
-                    continue
-                score = dy - (ov * 6.0)
-                if score < best_score:
-                    best_score, best_j = score, j
-
-            # b) fallback: plus proche verticalement (au-dessus/au-dessous) avec léger chevauchement
-            if best_j == -1:
-                nearest_j, nearest_d = -1, 1e9
-                for j, tl in enumerate(grouped):
-                    if used[j]:
-                        continue
-                    tx0, ty0, tx1, ty1 = tl["bbox"]
-                    cy_img = 0.5 * (iy0 + iy1)
-                    cy_txt = 0.5 * (ty0 + ty1)
-                    d = abs(cy_txt - cy_img)
-                    if overlap_ratio(ix0, ix1, tx0, tx1) < 0.12:
-                        continue
-                    if d < nearest_d:
-                        nearest_d, nearest_j = d, j
-                best_j = nearest_j
-
-            if best_j != -1:
-                used[best_j] = True
-                name = grouped[best_j]["text"].strip()
-                pairs_page.append({
-                    "name": name,
-                    "photo": im["dataurl"],
-                    "img_bbox": im["bbox"],
-                    "txt_bbox": grouped[best_j]["bbox"]
-                })
-
         stats.append({
             "page": page_index + 1,
             "lines_raw": len(raw_lines),
-            "lines_grouped": len(grouped),
             "images_with_bbox": len(images_with_bbox),
             "pairs": len(pairs_page)
         })
@@ -241,3 +178,66 @@ def extract_pairs():
             pairs_all.append({"page": page_index + 1, **p})
 
     return jsonify({"pairs": pairs_all, "stats": stats, "version": VERSION})
+
+# ---------- NOUVEAU : photo + crop de la zone du nom (pour OCR client) ----------
+@app.route("/api/extract_photo_labels", methods=["POST", "OPTIONS"])
+def extract_photo_labels():
+    """
+    Renvoie, pour chaque image, la photo + un crop (bandeau) juste sous la photo,
+    afin de faire l'OCR côté client (Tesseract.js).
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if "pdf" not in request.files:
+        return jsonify({"error": "missing file field 'pdf'"}), 400
+
+    data = request.files["pdf"].read()
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as e:
+        return jsonify({"error": f"cannot open pdf: {e}"}), 400
+
+    results = []
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+
+        # Tous les xrefs d'images (dédupliqués)
+        seen, xrefs = set(), []
+        for info in page.get_images(full=True):
+            xr = info[0]
+            if xr not in seen:
+                seen.add(xr)
+                xrefs.append(xr)
+
+        page_items = []
+        for xr in xrefs:
+            rects = page.get_image_rects(xr)
+            if not rects:
+                continue
+            r = rects[0]  # on suppose 1 position par portrait
+            img_w = r.width
+            img_h = r.height
+
+            # Photo (data URL, via xref)
+            photo = xref_to_dataurl(doc, xr)
+            if not photo:
+                continue
+
+            # Bandeau sous la photo: même largeur, hauteur ~30% de la hauteur photo (min 14pt, max 45%).
+            band_h = max(14, min(img_h * 0.45, img_h * 0.30))  # borne pour éviter trop grand/petit
+            label_rect = fitz.Rect(r.x0, r.y1, r.x1, r.y1 + band_h)
+            label = rect_to_dataurl(page, label_rect, scale=2.0)
+
+            page_items.append({
+                "photo": photo,
+                "label": label,
+                "bbox": [r.x0, r.y0, r.x1, r.y1]
+            })
+
+        results.append({
+            "page": page_index + 1,
+            "items": page_items
+        })
+
+    return jsonify({"pages": results, "version": VERSION})
