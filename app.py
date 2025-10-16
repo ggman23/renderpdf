@@ -1,17 +1,18 @@
-# app.py — Render (Flask + CORS + PyMuPDF) v2.6 (FIXED decorators)
-from flask import Flask, request, jsonify, send_from_directory
+# app.py — Flask on Render (v2.7) with PDF extraction + image proxy
+from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
-import base64, io, re
+import base64, io
 import fitz  # PyMuPDF
+import requests
+from urllib.parse import urlparse
 
-VERSION = "v2.6"
+VERSION = "v2.7"
 
 app = Flask(__name__, static_folder="static", static_url_path="/")
 CORS(app)
 
-# ---------------- Utils ----------------
+# ---------- Helpers ----------
 def xref_to_dataurl(doc, xref):
-    """Extract an embedded image by xref to a PNG/JPG data URL (robust fallback)."""
     try:
         meta = doc.extract_image(xref)
         if meta and "image" in meta:
@@ -34,201 +35,111 @@ def xref_to_dataurl(doc, xref):
         return None
 
 def rect_to_dataurl(page, rect, scale=3.0):
-    """Render a rectangle clip of a page to PNG data URL at given scale."""
     clip = fitz.Rect(rect).intersect(page.rect)
     if clip.is_empty:
         return None
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
     buf = io.BytesIO(pix.tobytes("png"))
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return "data:image/png;base64," + b64
 
-def overlap_ratio(a0, a1, b0, b1):
-    inter = max(0.0, min(a1, b1) - max(a0, b0))
-    width = max(a1 - a0, 1e-6)
-    return inter / width
-
-# ---------------- Basic routes ----------------
+# ---------- Basic ----------
 @app.get("/")
 def index():
     try:
         return send_from_directory(app.static_folder, "index.html")
     except Exception:
-        return jsonify({"ok": True, "msg": "Backend Render en ligne.", "version": VERSION})
+        return jsonify({"ok": True, "msg": "Backend OK", "version": VERSION})
 
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "version": VERSION})
 
-# ---------------- Simple image extraction ----------------
+# ---------- Simple: extract embedded images ----------
 @app.route("/api/extract_images", methods=["GET", "POST", "OPTIONS"])
 def extract_images():
     if request.method == "OPTIONS":
         return ("", 204)
     if request.method == "GET":
         return jsonify({"ok": True, "version": VERSION})
-
     if "pdf" not in request.files:
-        return jsonify({"error": "missing file field 'pdf'"}), 400
-
+        return jsonify({"error": "missing 'pdf'"}), 400
     data = request.files["pdf"].read()
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception as e:
         return jsonify({"error": f"cannot open pdf: {e}"}), 400
-
     pages_out, total = [], 0
-    for page_index in range(len(doc)):
-        page = doc[page_index]
+    for i in range(len(doc)):
+        page = doc[i]
         seen, xrefs = set(), []
         for info in page.get_images(full=True):
             xr = info[0]
             if xr not in seen:
-                seen.add(xr)
-                xrefs.append(xr)
-
+                seen.add(xr); xrefs.append(xr)
         images = []
         for xr in xrefs:
-            dataurl = xref_to_dataurl(doc, xr)
-            if dataurl:
-                images.append(dataurl)
-                total += 1
+            du = xref_to_dataurl(doc, xr)
+            if du:
+                images.append(du); total += 1
+        pages_out.append({"page": i+1, "images": images})
+    return jsonify({"pages": pages_out, "total": total, "version": VERSION})
 
-        pages_out.append({
-            "page": page_index + 1,
-            "images": images,
-            "debug": {"xrefs": len(xrefs), "images_extracted": len(images)}
-        })
-
-    return jsonify({"pages": pages_out, "debug": {"pages": len(doc), "total_images": total}, "version": VERSION})
-
-# ---------------- Vector-text pairing (may be empty on scanned PDFs) ----------------
-@app.route("/api/extract_pairs", methods=["GET", "POST", "OPTIONS"])
-def extract_pairs():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if request.method == "GET":
-        return jsonify({"ok": True, "version": VERSION})
-
-    if "pdf" not in request.files:
-        return jsonify({"error": "missing file field 'pdf'"}), 400
-
-    data = request.files["pdf"].read()
-    try:
-        doc = fitz.open(stream=data, filetype="pdf")
-    except Exception as e:
-        return jsonify({"error": f"cannot open pdf: {e}"}), 400
-
-    pairs_all, stats = [], []
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-
-        rd = page.get_text("rawdict")
-        raw_lines = []
-        for block in (rd.get("blocks") or []):
-            if block.get("type") == 0:
-                for line in (block.get("lines") or []):
-                    parts, x0, y0, x1, y1 = [], None, None, None, None
-                    for span in (line.get("spans") or []):
-                        s = (span.get("text") or "").strip()
-                        if not s:
-                            continue
-                        parts.append(s)
-                        bx0, by0, bx1, by1 = span.get("bbox") or [0, 0, 0, 0]
-                        x0 = bx0 if x0 is None else min(x0, bx0)
-                        y0 = by0 if y0 is None else min(y0, by0)
-                        x1 = bx1 if x1 is None else max(x1, bx1)
-                        y1 = by1 if y1 is None else max(y1, by1)
-                    if parts:
-                        raw_lines.append({"text": " ".join(parts).strip(), "bbox": (x0, y0, x1, y1)})
-
-        seen, xrefs = set(), []
-        for info in page.get_images(full=True):
-            xr = info[0]
-            if xr not in seen:
-                seen.add(xr)
-                xrefs.append(xr)
-
-        images_with_bbox = []
-        for xr in xrefs:
-            rects = page.get_image_rects(xr)
-            if not rects:
-                continue
-            r = rects[0]
-            bbox = (r.x0, r.y0, r.x1, r.y1)
-            dataurl = xref_to_dataurl(doc, xr)
-            if dataurl:
-                images_with_bbox.append({"dataurl": dataurl, "bbox": bbox, "xref": xr})
-
-        stats.append({
-            "page": page_index + 1,
-            "lines_raw": len(raw_lines),
-            "images_with_bbox": len(images_with_bbox),
-            "pairs": 0
-        })
-
-    return jsonify({"pairs": pairs_all, "stats": stats, "version": VERSION})
-
-# ---------------- NEW: photo + two label crops (below/above) for client-side OCR ----------------
-@app.route("/api/extract_photo_labels", methods=["POST", "OPTIONS"])
+# ---------- Photo + label crops (client OCR) ----------
+@app.post("/api/extract_photo_labels")
 def extract_photo_labels():
-    if request.method == "OPTIONS":
-        return ("", 204)
-
     if "pdf" not in request.files:
-        return jsonify({"error": "missing file field 'pdf'"}), 400
-
+        return jsonify({"error": "missing 'pdf'"}), 400
     data = request.files["pdf"].read()
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception as e:
         return jsonify({"error": f"cannot open pdf: {e}"}), 400
-
     results = []
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-
+    for pi in range(len(doc)):
+        page = doc[pi]
         seen, xrefs = set(), []
         for info in page.get_images(full=True):
             xr = info[0]
             if xr not in seen:
-                seen.add(xr)
-                xrefs.append(xr)
-
-        page_items = []
+                seen.add(xr); xrefs.append(xr)
+        items = []
         for xr in xrefs:
             rects = page.get_image_rects(xr)
-            if not rects:
-                continue
+            if not rects: continue
             r = rects[0]
             photo = xref_to_dataurl(doc, xr)
-            if not photo:
-                continue
-
-            w = r.width
-            h = r.height
+            if not photo: continue
+            w, h = r.width, r.height
             hx = w * 0.10
             gap = max(3.0, h * 0.03)
             band = max(14.0, min(h * 0.20, h * 0.22))
-
             below = fitz.Rect(r.x0 - hx, r.y1 + gap, r.x1 + hx, r.y1 + gap + band)
             above = fitz.Rect(r.x0 - hx, r.y0 - gap - band, r.x1 + hx, r.y0 - gap)
-
             label_below = rect_to_dataurl(page, below, scale=3.0)
             label_above = rect_to_dataurl(page, above, scale=3.0)
-
-            page_items.append({
-                "photo": photo,
-                "bbox": [r.x0, r.y0, r.x1, r.y1],
-                "label_below": label_below,
-                "label_above": label_above
-            })
-
-        results.append({"page": page_index + 1, "items": page_items})
-
+            items.append({"photo": photo, "bbox": [r.x0, r.y0, r.x1, r.y1], "label_below": label_below, "label_above": label_above})
+        results.append({"page": pi+1, "items": items})
     return jsonify({"pages": results, "version": VERSION})
 
+# ---------- NEW: Proxy image (convert cross-origin Pronote URLs -> same-origin bytes) ----------
+ALLOWED_HOST_SUFFIX = "index-education.net"
+
+@app.get("/api/proxy_image")
+def proxy_image():
+    url = request.args.get("url", "")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    u = urlparse(url)
+    if u.scheme not in ("http","https") or not u.netloc.endswith(ALLOWED_HOST_SUFFIX):
+        return jsonify({"error": "forbidden host"}), 403
+    try:
+        r = requests.get(url, timeout=12, stream=True)
+        content = r.content
+        ct = r.headers.get("Content-Type", "image/jpeg")
+        return Response(content, headers={"Content-Type": ct, "Cache-Control": "no-store"} , status=r.status_code)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
