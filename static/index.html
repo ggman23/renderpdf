@@ -1,100 +1,302 @@
-
 <!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Trombi Extract (Render) — Test</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;max-width:960px}
-    .row{display:flex;gap:12px;flex-wrap:wrap}
-    .card{border:1px solid #ddd;border-radius:12px;padding:14px}
-    .btn{border:1px solid #111;background:#111;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer}
-    .ghost{background:#f6f6f6;color:#111;border-color:#bbb}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
-    .pair{border:1px solid #eee;border-radius:10px;padding:10px}
-    img{width:100%;height:220px;object-fit:cover;border-radius:8px;border:1px solid #ddd;background:#fafafa}
-    pre{background:#0b1020;color:#d7e2ff;padding:10px;border-radius:8px;overflow:auto;max-height:220px}
-    .muted{color:#666}
-    .badge{display:inline-block;background:#eef;color:#223;padding:2px 8px;border-radius:999px;font-size:12px}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trombi — Coller + Proxy image + Export ZIP (index82)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:22px;max-width:1100px}
+  h1{margin:0 0 12px 0}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .btn{border:1px solid #111;background:#111;color:#fff;padding:8px 12px;border-radius:10px;cursor:pointer}
+  .ghost{background:#f6f6f6;color:#111;border-color:#bbb}
+  .muted{color:#666}
+  .area{border:2px dashed #999;border-radius:12px;padding:14px;min-height:120px;background:#fafafa}
+  .area[contenteditable="true"]:focus{outline:none;border-color:#333;background:#fff}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;margin-top:14px}
+  .card{border:1px solid #ddd;border-radius:14px;padding:12px}
+  .card img{width:100%;height:230px;object-fit:cover;border-radius:10px;border:1px solid #ddd;background:#fefefe}
+  .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+  .fields input{padding:8px;border:1px solid #bbb;border-radius:8px;width:100%}
+  select{padding:8px;border-radius:8px;border:1px solid #bbb;background:#fff}
+  pre{background:#0b1020;color:#d7e2ff;padding:10px;border-radius:8px;overflow:auto;max-height:260px}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
 <body>
-  <h1>Trombi Extract — Test Render</h1>
-  <p class="muted">Backend Flask sur Render (gunicorn) + PyMuPDF.</p>
-
+  <h1>Coller (Pronote/Excel) → Associer → Export CSV/ZIP</h1>
   <div class="card">
-    <div class="row" style="align-items:center">
-      <input id="file" type="file" accept="application/pdf">
-      <button id="ping" class="btn ghost" type="button">Tester l’API</button>
-      <button id="run" class="btn" type="button">Extraire</button>
+    <p>Collez depuis Pronote ou Excel. Les images Pronote (URLs protégées) sont converties via un <b>proxy</b> backend en blobs pour permettre les téléchargements/ZIP.</p>
+    <div class="row">
+      <button id="clear" class="btn ghost">Réinitialiser</button>
+      <label class="muted">Format CSV:
+        <select id="csvFormat">
+          <option value="semicolon-file">NOM;Prénom;Fichier</option>
+          <option value="comma-dataurl">last_name,first_name,imageDataURL</option>
+        </select>
+      </label>
+      <button id="exportCsv" class="btn ghost">Exporter CSV</button>
+      <button id="exportZip" class="btn">Exporter ZIP (images + CSV)</button>
+      <label class="muted"><input id="enforceCase" type="checkbox" checked> Forcer : NOM en MAJ + Prénom Capitalisé</label>
       <span id="status" class="muted"></span>
     </div>
-    <details style="margin-top:10px">
+    <div id="paste" class="area" contenteditable="true" spellcheck="false">Clique ici puis Ctrl/Cmd+V depuis Pronote (ou Excel).</div>
+    <details style="margin-top:10px" open>
       <summary>Logs</summary>
       <pre id="logs"></pre>
     </details>
   </div>
 
-  <div id="out" class="grid" style="margin-top:16px;"></div>
+  <div id="out" class="grid"></div>
 
 <script>
-const API = "/api/extract_images"; // même domaine (Render)
+(function(){
+  'use strict';
 
-const el = id => document.getElementById(id);
-const log = m => { el('logs').textContent += m + "\n"; el('logs').scrollTop = el('logs').scrollHeight; };
-const setStatus = t => { el('status').textContent = t; };
+  const PROXY = "/api/proxy_image"; // backend proxy to bypass CORS
+  const el = id => document.getElementById(id);
+  const log = m => { const L=el('logs'); L.textContent += m + "\n"; L.scrollTop = L.scrollHeight; };
+  const setStatus = t => { el('status').textContent = t; };
 
-async function pingAPI() {
-  setStatus("Ping…");
-  try {
-    const r = await fetch(API);
-    log("GET " + API + " -> " + r.status + " " + r.statusText);
-    const txt = await r.text();
-    log(txt);
-    setStatus(r.ok ? "API OK ✅" : "API KO ❌");
-  } catch (e) {
-    log("Erreur: " + e.message);
-    setStatus("API KO ❌");
+  function titleCaseFR(s){ return s.toLocaleLowerCase('fr-FR').replace(/\b([a-zà-öø-ÿ])/g, ch => ch.toLocaleUpperCase('fr-FR')); }
+  function splitPronote(full){
+    if(!full) return { last:"", first:"" };
+    full = full.replace(/\u00A0/g,' ').trim().replace(/[ \t\r]{2,}/g,' ');
+    full = full.split(/\n+/).map(s=>s.trim()).filter(Boolean).join(' ');
+    const idxLower = full.search(/[a-zà-öø-ÿ]/);
+    if(idxLower === -1){ const k = full.lastIndexOf(' '); return { last: k>0?full.slice(0,k).trim():full, first: k>0?full.slice(k+1).trim():"" }; }
+    const cut = full.lastIndexOf(' ', idxLower);
+    if(cut === -1) return { last:"", first: full };
+    return { last: full.slice(0,cut).trim(), first: full.slice(cut+1).trim() };
   }
-}
+  function enforceCase(p){ return { last: (p.last||'').toLocaleUpperCase('fr-FR'), first: titleCaseFR(p.first||'') }; }
 
-async function postPDF(file) {
-  const form = new FormData();
-  form.append("pdf", file, file.name);
-  const r = await fetch(API, { method: "POST", body: form });
-  log("POST " + API + " -> " + r.status);
-  if (!r.ok) throw new Error("API error: " + r.status);
-  return r.json();
-}
+  async function blobToDataURL(blob){ return await new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.readAsDataURL(blob); }); }
 
-async function run() {
-  const f = el('file').files?.[0];
-  if (!f) { alert("Choisis un PDF"); return; }
-  setStatus("Extraction…");
-  try {
-    const data = await postPDF(f);
-    const out = el('out'); out.innerHTML = "";
-    let count = 0;
-    for (const page of (data.pages||[])) {
-      (page.images||[]).forEach((src, idx) => {
-        count++;
-        const card = document.createElement('div');
-        card.className = "pair";
-        card.innerHTML = "<div class='badge'>Page " + page.page + " • #" + (idx+1) + "</div><img/>";
-        card.querySelector("img").src = src;
-        out.appendChild(card);
-      });
+  async function convertSrcToDataURL(src){
+    if(!src || src.startsWith("data:")) return src;
+    try{
+      const url = new URL(src, location.href).href;
+      const r = await fetch(PROXY + "?url=" + encodeURIComponent(url));
+      if(!r.ok) throw new Error("proxy " + r.status);
+      const b = await r.blob();
+      return await blobToDataURL(b);
+    }catch(e){
+      log("⚠️ Impossible de convertir via proxy : " + e.message);
+      return src;
     }
-    setStatus("OK ✅ " + count + " image(s)");
-  } catch (e) {
-    log("Erreur: " + e.message);
-    setStatus("❌ " + e.message);
   }
-}
 
-el('ping').addEventListener('click', pingAPI);
-el('run').addEventListener('click', run);
-</script>
+  function parseBlocksFromHTML(html){
+    const dom = new DOMParser().parseFromString(html, 'text/html');
+    const body = dom.body || dom;
+    const out = [];
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_ELEMENT, null);
+    while(walker.nextNode()){
+      const n = walker.currentNode;
+      const tag = (n.tagName||'').toLowerCase();
+      if(tag === 'img'){
+        out.push({type:'img', src: n.getAttribute('src') || ''});
+      }else{
+        const txt = (n.innerText || n.textContent || '').replace(/\u00A0/g,' ').trim();
+        if(txt) out.push({type:'text', text: txt});
+      }
+    }
+    return out;
+  }
+
+  function makeCard(imgSrc, fullText){
+    let parts = splitPronote(fullText||'');
+    if(el('enforceCase').checked) parts = enforceCase(parts);
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.innerHTML = `
+      <img>
+      <div class="fields">
+        <input class="last" placeholder="Nom (MAJ)" value="${parts.last}">
+        <input class="first" placeholder="Prénom (Cap.)" value="${parts.first}">
+      </div>`;
+    d.querySelector('img').src = imgSrc;
+    return d;
+  }
+
+  async function handlePaste(e){
+    try{
+      log("⎘ paste event");
+      e.preventDefault();
+      el('out').innerHTML=''; el('logs').textContent+=''; setStatus('Analyse du presse‑papiers…');
+
+      const cd = e.clipboardData;
+      const html = cd.getData('text/html');
+      const plain = cd.getData('text/plain');
+      log('Types: ' + Array.from(cd.types||[]).join(', '));
+
+      // 1) Images directes (Excel -> image/png)
+      const directImgs = [];
+      for(const it of cd.items){
+        if (it.type && it.type.startsWith('image/')){
+          const blob = it.getAsFile();
+          if(blob){ directImgs.push({type:'img', src: await blobToDataURL(blob)}); }
+        }
+      }
+
+      // 2) Blocs HTML ou texte
+      let blocks = [];
+      if(html){ blocks = parseBlocksFromHTML(html); }
+      else if(plain){ blocks = plain.split(/\n+/).map(t=>({type:'text', text:t.trim()})).filter(x=>x.text); }
+
+      // 3) Convertir toutes les images HTML via proxy -> dataURL
+      for(const b of blocks){
+        if(b.type==='img' && b.src && !b.src.startsWith('data:')){
+          b.src = await convertSrcToDataURL(b.src);
+        }
+      }
+
+      // 4) Séquence et pairing image -> texte qui suit
+      const seq = [];
+      const hasHtmlImg = blocks.some(b=>b.type==='img');
+      if (directImgs.length && !hasHtmlImg) seq.push(...directImgs);
+      seq.push(...blocks);
+
+      const out = el('out');
+      let paired = 0;
+      for(let i=0;i<seq.length;i++){
+        if(seq[i].type==='img'){
+          let txt = "";
+          for(let j=i+1;j<Math.min(seq.length, i+8);j++){
+            if(seq[j].type==='text' && /[A-Za-zÀ-ÖØ-öø-ÿ'’\- ]{2,}/.test(seq[j].text)){ txt = seq[j].text; break; }
+          }
+          out.appendChild(makeCard(seq[i].src, txt));
+          paired++;
+        }
+      }
+      setStatus("Trouvé " + paired + " photo(s).");
+      log("✅ pairing terminé: " + paired);
+    }catch(err){
+      console.error(err); log("❌ handlePaste: " + err.message);
+      setStatus("Erreur : " + err.message);
+    }
+  }
+
+  function toCsvRow(arr, sep=','){
+    return arr.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(sep);
+  }
+
+  function doExportCsv(){
+    try{
+      log("⬇️ export CSV click");
+      const fmt = el('csvFormat').value;
+      const cards = Array.from(document.querySelectorAll('.card'));
+      let sep = ',', header = [], rows = [];
+
+      if(fmt === 'semicolon-file'){
+        sep = ';';
+        header = ['NOM','Prénom','Fichier'];
+        rows.push(header);
+        cards.forEach((c,i)=>{
+          const last = c.querySelector('.last').value.trim();
+          const first = c.querySelector('.first').value.trim();
+          const base = (last.toLocaleUpperCase('fr-FR') + ' ' + first).replace(/[^A-Za-z0-9_\-À-ÖØ-öø-ÿ ]+/g,'').trim().replace(/ +/g,'_');
+          const fname = (base || ('eleve_'+(i+1))) + '.png';
+          rows.push([last, first, fname]);
+        });
+      } else {
+        sep = ',';
+        header = ['last_name','first_name','image'];
+        rows.push(header);
+        cards.forEach(c=>{
+          const last = c.querySelector('.last').value.trim();
+          const first = c.querySelector('.first').value.trim();
+          const src = c.querySelector('img').src;
+          rows.push([last, first, src]);
+        });
+      }
+
+      const csv = rows.map(r=>toCsvRow(r, sep)).join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+      const url = URL.createObjectURL(blob);
+      const name = (fmt === 'semicolon-file') ? 'trombi_pairs_semicolon.csv' : 'trombi_pairs_dataurl.csv';
+      const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 500);
+      log("✅ CSV téléchargé");
+    }catch(err){
+      console.error(err); log("❌ exportCsv: " + err.message);
+      alert("Erreur export CSV : " + err.message);
+    }
+  }
+
+  async function doExportZip(){
+    try{
+      log("⬇️ export ZIP click");
+      const zip = new JSZip();
+      const folder = zip.folder("photos");
+      const rows = [['NOM','Prénom','Fichier']];
+
+      const cards = Array.from(document.querySelectorAll('.card'));
+      for(let i=0;i<cards.length;i++){
+        const c = cards[i];
+        const last = c.querySelector('.last').value.trim();
+        const first = c.querySelector('.first').value.trim();
+        let src = c.querySelector('img').src;
+        if(!src.startsWith("data:")) src = await convertSrcToDataURL(src); // sécurité
+
+        const base = (last.toLocaleUpperCase('fr-FR') + ' ' + first).replace(/[^A-Za-z0-9_\-À-ÖØ-öø-ÿ ]+/g,'').trim().replace(/ +/g,'_');
+        const fname = (base || ('eleve_'+(i+1))) + '.png';
+        rows.push([last, first, 'photos/'+fname]);
+
+        const b64 = (src.split(',')[1]||''); // dataURL -> base64
+        folder.file(fname, b64, {base64:true});
+      }
+
+      const csv = rows.map(r=>toCsvRow(r, ';')).join('\n');
+      zip.file('pairs.csv', csv);
+
+      const blob = await zip.generateAsync({type:'blob'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'trombi_export.zip'; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 800);
+      log("✅ ZIP téléchargé");
+    }catch(err){
+      console.error(err); log("❌ exportZip: " + err.message);
+      alert("Erreur export ZIP : " + err.message);
+    }
+  }
+
+  function wire(){
+    el('paste').addEventListener('paste', handlePaste);
+    el('clear').addEventListener('click', ()=>{
+      try{
+        el('paste').innerHTML='Clique ici puis Ctrl/Cmd+V depuis Pronote (ou Excel).';
+        el('out').innerHTML=''; el('logs').textContent=''; setStatus('');
+        log("♻️ réinitialisé");
+      }catch(err){ log("❌ clear: " + err.message); }
+    });
+    el('exportCsv').addEventListener('click', doExportCsv);
+    el('exportZip').addEventListener('click', doExportZip);
+    el('enforceCase').addEventListener('change', ()=>{
+      try{
+        document.querySelectorAll('.card').forEach(c=>{
+          const lastInput = c.querySelector('.last');
+          const firstInput = c.querySelector('.first');
+          // Repart de la concat NOM + Prénom
+          let parts = splitPronote((lastInput.value + ' ' + firstInput.value).trim());
+          if(el('enforceCase').checked) parts = enforceCase(parts);
+          lastInput.value = parts.last;
+          firstInput.value = parts.first;
+        });
+        log("🔠 règle de casse appliquée");
+      }catch(err){ log("❌ enforceCase: " + err.message); }
+    });
+    log("🟢 événements attachés");
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', wire, {once:true});
+  }else{
+    wire();
+  }
+
+})();</script>
 </body>
 </html>
