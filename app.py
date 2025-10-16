@@ -1,4 +1,4 @@
-# app.py — Render (Flask + CORS + PyMuPDF) v2.6
+# app.py — Render (Flask + CORS + PyMuPDF) v2.6 (FIXED decorators)
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import base64, io, re
@@ -62,7 +62,7 @@ def healthz():
     return jsonify({"ok": True, "version": VERSION})
 
 # ---------------- Simple image extraction ----------------
-@app.route("/api/extract_images", methods=["GET", "POST", "OPTIONS")
+@app.route("/api/extract_images", methods=["GET", "POST", "OPTIONS"])
 def extract_images():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -104,7 +104,7 @@ def extract_images():
     return jsonify({"pages": pages_out, "debug": {"pages": len(doc), "total_images": total}, "version": VERSION})
 
 # ---------------- Vector-text pairing (may be empty on scanned PDFs) ----------------
-@app.route("/api/extract_pairs", methods=["GET", "POST", "OPTIONS")
+@app.route("/api/extract_pairs", methods=["GET", "POST", "OPTIONS"])
 def extract_pairs():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -171,7 +171,7 @@ def extract_pairs():
     return jsonify({"pairs": pairs_all, "stats": stats, "version": VERSION})
 
 # ---------------- NEW: photo + two label crops (below/above) for client-side OCR ----------------
-@app.route("/api/extract_photo_labels", methods=["POST", "OPTIONS")
+@app.route("/api/extract_photo_labels", methods=["POST", "OPTIONS"])
 def extract_photo_labels():
     if request.method == "OPTIONS":
         return ("", 204)
