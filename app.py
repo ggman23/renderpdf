@@ -1,13 +1,13 @@
-# app.py — Render (Flask + CORS + PyMuPDF) v2.2
+# app.py — Render (Flask + CORS + PyMuPDF) v2.3
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import base64, io, re
 import fitz  # PyMuPDF
 
-VERSION = "v2.2"
+VERSION = "v2.3"
 
 app = Flask(__name__, static_folder="static", static_url_path="/")
-CORS(app)  # Access-Control-Allow-Origin: *
+CORS(app)
 
 NAME_RX = re.compile(r"[A-Za-zÀ-ÿ'’\- ]{3,}")
 
@@ -60,7 +60,6 @@ def extract_images():
     if request.method == "GET":
         return jsonify({"ok": True, "version": VERSION})
 
-    # POST
     if "pdf" not in request.files:
         return jsonify({"error": "missing file field 'pdf'"}), 400
 
@@ -70,11 +69,9 @@ def extract_images():
     except Exception as e:
         return jsonify({"error": f"cannot open pdf: {e}"}), 400
 
-    pages_out = []
-    total = 0
+    pages_out, total = [], 0
     for page_index in range(len(doc)):
         page = doc[page_index]
-        # xrefs dédupliqués
         seen, xrefs = set(), []
         for info in page.get_images(full=True):
             xr = info[0]
@@ -103,10 +100,8 @@ def extract_pairs():
     if request.method == "OPTIONS":
         return ("", 204)
     if request.method == "GET":
-        # ping simple pour éviter 405 si on teste en GET
         return jsonify({"ok": True, "version": VERSION})
 
-    # POST
     if "pdf" not in request.files:
         return jsonify({"error": "missing file field 'pdf'"}), 400
 
@@ -116,13 +111,12 @@ def extract_pairs():
     except Exception as e:
         return jsonify({"error": f"cannot open pdf: {e}"}), 400
 
-    pairs_all = []
-    stats = []
+    pairs_all, stats = [], []
 
     for page_index in range(len(doc)):
         page = doc[page_index]
 
-        # Texte + bbox
+        # 1) TEXTE (candidats noms) via rawdict
         rd = page.get_text("rawdict")
         text_lines = []
         for block in (rd.get("blocks") or []):
@@ -141,16 +135,11 @@ def extract_pairs():
                         y1 = by1 if y1 is None else max(y1, by1)
                     if parts:
                         text = " ".join(parts).strip()
+                        # on garde large (noms/prénoms, accents, tirets)
                         if NAME_RX.search(text) and len(text.split()) >= 2:
                             text_lines.append({"text": text, "bbox": (x0, y0, x1, y1)})
 
-        # Image bbox quand dispo + dataurls
-        xref_to_bbox = {}
-        for block in (rd.get("blocks") or []):
-            if block.get("type") == 1 and block.get("xref"):
-                xref_to_bbox[block["xref"]] = tuple(block.get("bbox") or [0,0,0,0])
-
-        # Tous les xrefs (garanti)
+        # 2) IMAGES: xrefs (garanti) + BBOX par get_image_rects(xref)
         seen, xrefs = set(), []
         for info in page.get_images(full=True):
             xr = info[0]
@@ -158,29 +147,28 @@ def extract_pairs():
                 seen.add(xr)
                 xrefs.append(xr)
 
-        # Images avec bbox
         images_with_bbox = []
         for xr in xrefs:
-            if xr in xref_to_bbox:
-                dataurl = xref_to_dataurl(doc, xr)
-                if dataurl:
-                    images_with_bbox.append({"dataurl": dataurl, "bbox": xref_to_bbox[xr], "xref": xr})
+            rects = page.get_image_rects(xr)  # <- clé : récupère les rectangles où l'image est affichée
+            if not rects:
+                continue
+            # on prend le premier rectangle (cas général trombinoscope)
+            r = rects[0]
+            bbox = (r.x0, r.y0, r.x1, r.y1)
+            dataurl = xref_to_dataurl(doc, xr)
+            if dataurl:
+                images_with_bbox.append({"dataurl": dataurl, "bbox": bbox, "xref": xr})
 
-        # Matching
-        used = [False] * len(text_lines)
-        dy_limit = max(page.rect.height * 0.06, 12)
+        # 3) MATCHING image -> texte
         pairs_page = []
-
-        def overlap_ratio(a0, a1, b0, b1):
-            inter = max(0.0, min(a1, b1) - max(a0, b0))
-            width = max(a1 - a0, 1e-6)
-            return inter / width
+        used = [False] * len(text_lines)
+        dy_limit = max(page.rect.height * 0.08, 14)  # un peu plus large qu'avant
 
         for im in images_with_bbox:
             ix0, iy0, ix1, iy1 = im["bbox"]
             best_j, best_score = -1, 1e9
 
-            # sous la photo
+            # a) priorité aux noms sous la photo avec chevauchement horizontal
             for j, tl in enumerate(text_lines):
                 if used[j]:
                     continue
@@ -191,13 +179,13 @@ def extract_pairs():
                 if dy > dy_limit:
                     continue
                 overlap = overlap_ratio(ix0, ix1, tx0, tx1)
-                if overlap < 0.3:
+                if overlap < 0.25:
                     continue
-                score = dy - (overlap * 5.0)
+                score = dy - (overlap * 6.0)  # favorise fort chevauchement
                 if score < best_score:
                     best_score, best_j = score, j
 
-            # fallback: plus proche verticalement avec léger chevauchement
+            # b) fallback : plus proche verticalement (au-dessus/au-dessous) avec petit chevauchement
             if best_j == -1:
                 nearest_j, nearest_d = -1, 1e9
                 for j, tl in enumerate(text_lines):
@@ -207,7 +195,7 @@ def extract_pairs():
                     cy_img = 0.5 * (iy0 + iy1)
                     cy_txt = 0.5 * (ty0 + ty1)
                     d = abs(cy_txt - cy_img)
-                    if overlap_ratio(ix0, ix1, tx0, tx1) < 0.2:
+                    if overlap_ratio(ix0, ix1, tx0, tx1) < 0.15:
                         continue
                     if d < nearest_d:
                         nearest_d, nearest_j = d, j
@@ -226,7 +214,8 @@ def extract_pairs():
         stats.append({
             "page": page_index + 1,
             "text_lines": len(text_lines),
-            "xrefs_bbox": len(xref_to_bbox),
+            "xrefs": len(xrefs),
+            "images_with_bbox": len(images_with_bbox),
             "pairs": len(pairs_page)
         })
         for p in pairs_page:
