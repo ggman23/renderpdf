@@ -1,0 +1,100 @@
+
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trombi Extract (Render) — Test</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;max-width:960px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .card{border:1px solid #ddd;border-radius:12px;padding:14px}
+    .btn{border:1px solid #111;background:#111;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer}
+    .ghost{background:#f6f6f6;color:#111;border-color:#bbb}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+    .pair{border:1px solid #eee;border-radius:10px;padding:10px}
+    img{width:100%;height:220px;object-fit:cover;border-radius:8px;border:1px solid #ddd;background:#fafafa}
+    pre{background:#0b1020;color:#d7e2ff;padding:10px;border-radius:8px;overflow:auto;max-height:220px}
+    .muted{color:#666}
+    .badge{display:inline-block;background:#eef;color:#223;padding:2px 8px;border-radius:999px;font-size:12px}
+  </style>
+</head>
+<body>
+  <h1>Trombi Extract — Test Render</h1>
+  <p class="muted">Backend Flask sur Render (gunicorn) + PyMuPDF.</p>
+
+  <div class="card">
+    <div class="row" style="align-items:center">
+      <input id="file" type="file" accept="application/pdf">
+      <button id="ping" class="btn ghost" type="button">Tester l’API</button>
+      <button id="run" class="btn" type="button">Extraire</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <details style="margin-top:10px">
+      <summary>Logs</summary>
+      <pre id="logs"></pre>
+    </details>
+  </div>
+
+  <div id="out" class="grid" style="margin-top:16px;"></div>
+
+<script>
+const API = "/api/extract_images"; // même domaine (Render)
+
+const el = id => document.getElementById(id);
+const log = m => { el('logs').textContent += m + "\n"; el('logs').scrollTop = el('logs').scrollHeight; };
+const setStatus = t => { el('status').textContent = t; };
+
+async function pingAPI() {
+  setStatus("Ping…");
+  try {
+    const r = await fetch(API);
+    log("GET " + API + " -> " + r.status + " " + r.statusText);
+    const txt = await r.text();
+    log(txt);
+    setStatus(r.ok ? "API OK ✅" : "API KO ❌");
+  } catch (e) {
+    log("Erreur: " + e.message);
+    setStatus("API KO ❌");
+  }
+}
+
+async function postPDF(file) {
+  const form = new FormData();
+  form.append("pdf", file, file.name);
+  const r = await fetch(API, { method: "POST", body: form });
+  log("POST " + API + " -> " + r.status);
+  if (!r.ok) throw new Error("API error: " + r.status);
+  return r.json();
+}
+
+async function run() {
+  const f = el('file').files?.[0];
+  if (!f) { alert("Choisis un PDF"); return; }
+  setStatus("Extraction…");
+  try {
+    const data = await postPDF(f);
+    const out = el('out'); out.innerHTML = "";
+    let count = 0;
+    for (const page of (data.pages||[])) {
+      (page.images||[]).forEach((src, idx) => {
+        count++;
+        const card = document.createElement('div');
+        card.className = "pair";
+        card.innerHTML = "<div class='badge'>Page " + page.page + " • #" + (idx+1) + "</div><img/>";
+        card.querySelector("img").src = src;
+        out.appendChild(card);
+      });
+    }
+    setStatus("OK ✅ " + count + " image(s)");
+  } catch (e) {
+    log("Erreur: " + e.message);
+    setStatus("❌ " + e.message);
+  }
+}
+
+el('ping').addEventListener('click', pingAPI);
+el('run').addEventListener('click', run);
+</script>
+</body>
+</html>
