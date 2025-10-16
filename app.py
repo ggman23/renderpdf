@@ -1,19 +1,18 @@
-# app.py — Render (Flask + CORS + PyMuPDF) v2.3
+# app.py — Render (Flask + CORS + PyMuPDF) v2.4
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import base64, io, re
 import fitz  # PyMuPDF
 
-VERSION = "v2.3"
+VERSION = "v2.4"
 
 app = Flask(__name__, static_folder="static", static_url_path="/")
 CORS(app)
 
-NAME_RX = re.compile(r"[A-Za-zÀ-ÿ'’\- ]{3,}")
+# assez large: lettres, accents, apostrophes/traits d’union, éventuellement chiffres
+LINE_RX = re.compile(r"[A-Za-zÀ-ÿ0-9'’\- ]{2,}")
 
-# ---------- Utils ----------
 def xref_to_dataurl(doc, xref):
-    """Extraction robuste d'une image à partir d'un xref (extract_image puis Pixmap fallback)."""
     try:
         meta = doc.extract_image(xref)
         if meta and "image" in meta:
@@ -40,7 +39,6 @@ def overlap_ratio(a0, a1, b0, b1):
     width = max(a1 - a0, 1e-6)
     return inter / width
 
-# ---------- Routes basiques ----------
 @app.get("/")
 def index():
     try:
@@ -52,7 +50,7 @@ def index():
 def healthz():
     return jsonify({"ok": True, "version": VERSION})
 
-# ---------- Extraction simple ----------
+# ----- extraction simple (inchangé) -----
 @app.route("/api/extract_images", methods=["GET", "POST", "OPTIONS"])
 def extract_images():
     if request.method == "OPTIONS":
@@ -94,7 +92,7 @@ def extract_images():
 
     return jsonify({"pages": pages_out, "debug": {"pages": len(doc), "total_images": total}, "version": VERSION})
 
-# ---------- Appariement (images -> noms) ----------
+# ----- appariement image -> nom (avec groupement de lignes) -----
 @app.route("/api/extract_pairs", methods=["GET", "POST", "OPTIONS"])
 def extract_pairs():
     if request.method == "OPTIONS":
@@ -116,9 +114,9 @@ def extract_pairs():
     for page_index in range(len(doc)):
         page = doc[page_index]
 
-        # 1) TEXTE (candidats noms) via rawdict
+        # --- 1) lignes de texte brutes ---
         rd = page.get_text("rawdict")
-        text_lines = []
+        raw_lines = []  # [{text, bbox}]
         for block in (rd.get("blocks") or []):
             if block.get("type") == 0:
                 for line in (block.get("lines") or []):
@@ -127,19 +125,41 @@ def extract_pairs():
                         s = (span.get("text") or "").strip()
                         if not s:
                             continue
+                        if not LINE_RX.search(s):
+                            continue
                         parts.append(s)
-                        bx0, by0, bx1, by1 = span.get("bbox") or [0,0,0,0]
+                        bx0, by0, bx1, by1 = span.get("bbox") or [0, 0, 0, 0]
                         x0 = bx0 if x0 is None else min(x0, bx0)
                         y0 = by0 if y0 is None else min(y0, by0)
                         x1 = bx1 if x1 is None else max(x1, bx1)
                         y1 = by1 if y1 is None else max(y1, by1)
                     if parts:
-                        text = " ".join(parts).strip()
-                        # on garde large (noms/prénoms, accents, tirets)
-                        if NAME_RX.search(text) and len(text.split()) >= 2:
-                            text_lines.append({"text": text, "bbox": (x0, y0, x1, y1)})
+                        txt = " ".join(parts).strip()
+                        raw_lines.append({"text": txt, "bbox": (x0, y0, x1, y1)})
 
-        # 2) IMAGES: xrefs (garanti) + BBOX par get_image_rects(xref)
+        # --- 2) regroupement de lignes empilées (NOM + PRÉNOM) ---
+        raw_lines.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))  # tri par y puis x
+        grouped = []
+        for ln in raw_lines:
+            merged = False
+            # essaie de fusionner avec le dernier groupe si proche en Y et bon chevauchement horizontal
+            if grouped:
+                g = grouped[-1]
+                gx0, gy0, gx1, gy1 = g["bbox"]
+                lx0, ly0, lx1, ly1 = ln["bbox"]
+                # proximité verticale (petit saut entre lignes)
+                vgap = ly0 - gy1
+                # grille Pronote: on tolère ~2.5% de la hauteur page + 4px
+                vlimit = max(page.rect.height * 0.025, 4)
+                if vgap >= -2 and vgap <= vlimit and overlap_ratio(gx0, gx1, lx0, lx1) >= 0.4:
+                    # fusion
+                    g["text"] = (g["text"] + " " + ln["text"]).strip()
+                    g["bbox"] = (min(gx0, lx0), min(gy0, ly0), max(gx1, lx1), max(gy1, ly1))
+                    merged = True
+            if not merged:
+                grouped.append(dict(text=ln["text"], bbox=ln["bbox"]))
+
+        # --- 3) toutes les images + BBOX via get_image_rects ---
         seen, xrefs = set(), []
         for info in page.get_images(full=True):
             xr = info[0]
@@ -149,27 +169,26 @@ def extract_pairs():
 
         images_with_bbox = []
         for xr in xrefs:
-            rects = page.get_image_rects(xr)  # <- clé : récupère les rectangles où l'image est affichée
+            rects = page.get_image_rects(xr)
             if not rects:
                 continue
-            # on prend le premier rectangle (cas général trombinoscope)
             r = rects[0]
             bbox = (r.x0, r.y0, r.x1, r.y1)
             dataurl = xref_to_dataurl(doc, xr)
             if dataurl:
                 images_with_bbox.append({"dataurl": dataurl, "bbox": bbox, "xref": xr})
 
-        # 3) MATCHING image -> texte
+        # --- 4) appariement ---
         pairs_page = []
-        used = [False] * len(text_lines)
-        dy_limit = max(page.rect.height * 0.08, 14)  # un peu plus large qu'avant
+        used = [False] * len(grouped)
+        dy_limit = max(page.rect.height * 0.09, 16)  # fenêtre verticale un peu plus large
 
         for im in images_with_bbox:
             ix0, iy0, ix1, iy1 = im["bbox"]
             best_j, best_score = -1, 1e9
 
-            # a) priorité aux noms sous la photo avec chevauchement horizontal
-            for j, tl in enumerate(text_lines):
+            # a) candidats sous la photo avec chevauchement horizontal
+            for j, tl in enumerate(grouped):
                 if used[j]:
                     continue
                 tx0, ty0, tx1, ty1 = tl["bbox"]
@@ -178,24 +197,24 @@ def extract_pairs():
                 dy = ty0 - iy1
                 if dy > dy_limit:
                     continue
-                overlap = overlap_ratio(ix0, ix1, tx0, tx1)
-                if overlap < 0.25:
+                ov = overlap_ratio(ix0, ix1, tx0, tx1)
+                if ov < 0.22:
                     continue
-                score = dy - (overlap * 6.0)  # favorise fort chevauchement
+                score = dy - (ov * 6.0)
                 if score < best_score:
                     best_score, best_j = score, j
 
-            # b) fallback : plus proche verticalement (au-dessus/au-dessous) avec petit chevauchement
+            # b) fallback: plus proche verticalement (au-dessus/au-dessous) avec léger chevauchement
             if best_j == -1:
                 nearest_j, nearest_d = -1, 1e9
-                for j, tl in enumerate(text_lines):
+                for j, tl in enumerate(grouped):
                     if used[j]:
                         continue
                     tx0, ty0, tx1, ty1 = tl["bbox"]
                     cy_img = 0.5 * (iy0 + iy1)
                     cy_txt = 0.5 * (ty0 + ty1)
                     d = abs(cy_txt - cy_img)
-                    if overlap_ratio(ix0, ix1, tx0, tx1) < 0.15:
+                    if overlap_ratio(ix0, ix1, tx0, tx1) < 0.12:
                         continue
                     if d < nearest_d:
                         nearest_d, nearest_j = d, j
@@ -203,18 +222,18 @@ def extract_pairs():
 
             if best_j != -1:
                 used[best_j] = True
-                name = text_lines[best_j]["text"].strip()
+                name = grouped[best_j]["text"].strip()
                 pairs_page.append({
                     "name": name,
                     "photo": im["dataurl"],
                     "img_bbox": im["bbox"],
-                    "txt_bbox": text_lines[best_j]["bbox"]
+                    "txt_bbox": grouped[best_j]["bbox"]
                 })
 
         stats.append({
             "page": page_index + 1,
-            "text_lines": len(text_lines),
-            "xrefs": len(xrefs),
+            "lines_raw": len(raw_lines),
+            "lines_grouped": len(grouped),
             "images_with_bbox": len(images_with_bbox),
             "pairs": len(pairs_page)
         })
