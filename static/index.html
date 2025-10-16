@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Trombi — Coller + Proxy image + Export ZIP (index82)</title>
+<title>Trombi — Coller (Pronote/Excel) → Export CSV/ZIP (index86)</title>
 <style>
   :root { color-scheme: light dark; }
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:22px;max-width:1100px}
@@ -11,6 +11,7 @@
   .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
   .btn{border:1px solid #111;background:#111;color:#fff;padding:8px 12px;border-radius:10px;cursor:pointer}
   .ghost{background:#f6f6f6;color:#111;border-color:#bbb}
+  .danger{background:#b00020;border-color:#b00020}
   .muted{color:#666}
   .area{border:2px dashed #999;border-radius:12px;padding:14px;min-height:120px;background:#fafafa}
   .area[contenteditable="true"]:focus{outline:none;border-color:#333;background:#fff}
@@ -19,7 +20,7 @@
   .card img{width:100%;height:230px;object-fit:cover;border-radius:10px;border:1px solid #ddd;background:#fefefe}
   .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
   .fields input{padding:8px;border:1px solid #bbb;border-radius:8px;width:100%}
-  select{padding:8px;border-radius:8px;border:1px solid #bbb;background:#fff}
+  select,input[type="text"]{padding:8px;border-radius:8px;border:1px solid #bbb;background:#fff}
   pre{background:#0b1020;color:#d7e2ff;padding:10px;border-radius:8px;overflow:auto;max-height:260px}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
@@ -27,7 +28,7 @@
 <body>
   <h1>Coller (Pronote/Excel) → Associer → Export CSV/ZIP</h1>
   <div class="card">
-    <p>Collez depuis Pronote ou Excel. Les images Pronote (URLs protégées) sont converties via un <b>proxy</b> backend en blobs pour permettre les téléchargements/ZIP.</p>
+    <p>Les images Pronote (URLs protégées) sont converties via un <b>proxy</b> backend en blobs pour permettre les téléchargements/ZIP.</p>
     <div class="row">
       <button id="clear" class="btn ghost">Réinitialiser</button>
       <label class="muted">Format CSV:
@@ -39,6 +40,13 @@
       <button id="exportCsv" class="btn ghost">Exporter CSV</button>
       <button id="exportZip" class="btn">Exporter ZIP (images + CSV)</button>
       <label class="muted"><input id="enforceCase" type="checkbox" checked> Forcer : NOM en MAJ + Prénom Capitalisé</label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label class="muted">Backend proxy :
+        <input id="backendUrl" type="text" size="42" placeholder="https://renderpdf-xxx.onrender.com">
+      </label>
+      <button id="applyBackend" class="btn ghost">Appliquer</button>
+      <button id="cancel" class="btn danger" title="Arrêter l'analyse en cours">Stop</button>
       <span id="status" class="muted"></span>
     </div>
     <div id="paste" class="area" contenteditable="true" spellcheck="false">Clique ici puis Ctrl/Cmd+V depuis Pronote (ou Excel).</div>
@@ -54,16 +62,27 @@
 (function(){
   'use strict';
 
-  const PROXY = "/api/proxy_image"; // backend proxy to bypass CORS
+  // ===== Config backend (local + Render) =====
+  let BACKEND = (location.origin.startsWith('http') && location.hostname.endsWith('onrender.com'))
+    ? location.origin
+    : (localStorage.getItem('backend-url') || 'https://renderpdf-3hvn.onrender.com');
   const el = id => document.getElementById(id);
-  const log = m => { const L=el('logs'); L.textContent += m + "\n"; L.scrollTop = L.scrollHeight; };
+  const log = m => { const L=el('logs'); L.textContent += m + "\\n"; L.scrollTop = L.scrollHeight; };
   const setStatus = t => { el('status').textContent = t; };
+  const PROXY = () => BACKEND.replace(/\/+$/,'') + "/api/proxy_image";
+  document.getElementById('backendUrl').value = BACKEND;
 
-  function titleCaseFR(s){ return s.toLocaleLowerCase('fr-FR').replace(/\b([a-zà-öø-ÿ])/g, ch => ch.toLocaleUpperCase('fr-FR')); }
+  el('applyBackend').addEventListener('click', ()=>{
+    const val = el('backendUrl').value.trim();
+    if(val){ BACKEND = val; localStorage.setItem('backend-url', BACKEND); log("🔧 Backend défini: " + BACKEND); setStatus("Backend: " + BACKEND); }
+  });
+
+  // ===== Utils =====
+  function titleCaseFR(s){ return s.toLocaleLowerCase('fr-FR').replace(/\\b([a-zà-öø-ÿ])/g, ch => ch.toLocaleUpperCase('fr-FR')); }
   function splitPronote(full){
     if(!full) return { last:"", first:"" };
-    full = full.replace(/\u00A0/g,' ').trim().replace(/[ \t\r]{2,}/g,' ');
-    full = full.split(/\n+/).map(s=>s.trim()).filter(Boolean).join(' ');
+    full = full.replace(/\\u00A0/g,' ').trim().replace(/[ \\t\\r]{2,}/g,' ');
+    full = full.split(/\\n+/).map(s=>s.trim()).filter(Boolean).join(' ');
     const idxLower = full.search(/[a-zà-öø-ÿ]/);
     if(idxLower === -1){ const k = full.lastIndexOf(' '); return { last: k>0?full.slice(0,k).trim():full, first: k>0?full.slice(k+1).trim():"" }; }
     const cut = full.lastIndexOf(' ', idxLower);
@@ -74,18 +93,27 @@
 
   async function blobToDataURL(blob){ return await new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.readAsDataURL(blob); }); }
 
+  // fetch avec timeout
+  async function fetchWithTimeout(url, opts={}){
+    const { timeout = 12000 } = opts;
+    const controller = new AbortController();
+    const id = setTimeout(()=>controller.abort('timeout'), timeout);
+    try{
+      const res = await fetch(url, {...opts, signal: controller.signal});
+      return res;
+    } finally {
+      clearTimeout(id);
+    }
+  }
+
   async function convertSrcToDataURL(src){
     if(!src || src.startsWith("data:")) return src;
-    try{
-      const url = new URL(src, location.href).href;
-      const r = await fetch(PROXY + "?url=" + encodeURIComponent(url));
-      if(!r.ok) throw new Error("proxy " + r.status);
-      const b = await r.blob();
-      return await blobToDataURL(b);
-    }catch(e){
-      log("⚠️ Impossible de convertir via proxy : " + e.message);
-      return src;
-    }
+    const url = new URL(src, location.href).href;
+    const endpoint = PROXY() + "?url=" + encodeURIComponent(url);
+    const r = await fetchWithTimeout(endpoint, {timeout: 12000});
+    if(!r.ok) throw new Error("proxy " + r.status);
+    const b = await r.blob();
+    return await blobToDataURL(b);
   }
 
   function parseBlocksFromHTML(html){
@@ -99,7 +127,7 @@
       if(tag === 'img'){
         out.push({type:'img', src: n.getAttribute('src') || ''});
       }else{
-        const txt = (n.innerText || n.textContent || '').replace(/\u00A0/g,' ').trim();
+        const txt = (n.innerText || n.textContent || '').replace(/\\u00A0/g,' ').trim();
         if(txt) out.push({type:'text', text: txt});
       }
     }
@@ -111,14 +139,35 @@
     if(el('enforceCase').checked) parts = enforceCase(parts);
     const d = document.createElement('div');
     d.className = 'card';
-    d.innerHTML = `
+    d.innerHTML = \`
       <img>
       <div class="fields">
-        <input class="last" placeholder="Nom (MAJ)" value="${parts.last}">
-        <input class="first" placeholder="Prénom (Cap.)" value="${parts.first}">
-      </div>`;
+        <input class="last" placeholder="Nom (MAJ)" value="\${parts.last}">
+        <input class="first" placeholder="Prénom (Cap.)" value="\${parts.first}">
+      </div>\`;
     d.querySelector('img').src = imgSrc;
     return d;
+  }
+
+  // Convertit en parallèle limitée (4) avec progression; ignore les erreurs
+  async function convertAllImagesViaProxy(blocks){
+    const idxs = [];
+    for(let i=0;i<blocks.length;i++) if(blocks[i].type==='img' && blocks[i].src && !blocks[i].src.startsWith('data:')) idxs.push(i);
+    let done = 0;
+    const limit = 4;
+    async function worker(){
+      while(idxs.length){
+        const i = idxs.shift();
+        try{
+          blocks[i].src = await convertSrcToDataURL(blocks[i].src);
+        }catch(err){
+          log("⚠️ proxy échec ("+err.message+") → on garde l'URL");
+        }finally{
+          done++; if(done%1===0) setStatus(\`Conversion images via proxy… \${done}/\${blocks.filter(b=>b.type==='img').length}\`);
+        }
+      }
+    }
+    await Promise.all(new Array(Math.min(limit, idxs.length||1)).fill(0).map(worker));
   }
 
   async function handlePaste(e){
@@ -134,7 +183,7 @@
 
       // 1) Images directes (Excel -> image/png)
       const directImgs = [];
-      for(const it of cd.items){
+      for(const it of (cd.items||[])){
         if (it.type && it.type.startsWith('image/')){
           const blob = it.getAsFile();
           if(blob){ directImgs.push({type:'img', src: await blobToDataURL(blob)}); }
@@ -144,14 +193,12 @@
       // 2) Blocs HTML ou texte
       let blocks = [];
       if(html){ blocks = parseBlocksFromHTML(html); }
-      else if(plain){ blocks = plain.split(/\n+/).map(t=>({type:'text', text:t.trim()})).filter(x=>x.text); }
+      else if(plain){ blocks = plain.split(/\\n+/).map(t=>({type:'text', text:t.trim()})).filter(x=>x.text); }
 
-      // 3) Convertir toutes les images HTML via proxy -> dataURL
-      for(const b of blocks){
-        if(b.type==='img' && b.src && !b.src.startsWith('data:')){
-          b.src = await convertSrcToDataURL(b.src);
-        }
-      }
+      log(\`Blocs: \${blocks.length} (img:\${blocks.filter(b=>b.type==='img').length}, text:\${blocks.filter(b=>b.type==='text').length})\`);
+
+      // 3) Convertir les <img> via proxy avec timeout et progression
+      await convertAllImagesViaProxy(blocks);
 
       // 4) Séquence et pairing image -> texte qui suit
       const seq = [];
@@ -165,13 +212,13 @@
         if(seq[i].type==='img'){
           let txt = "";
           for(let j=i+1;j<Math.min(seq.length, i+8);j++){
-            if(seq[j].type==='text' && /[A-Za-zÀ-ÖØ-öø-ÿ'’\- ]{2,}/.test(seq[j].text)){ txt = seq[j].text; break; }
+            if(seq[j].type==='text' && /[A-Za-zÀ-ÖØ-öø-ÿ'’\\- ]{2,}/.test(seq[j].text)){ txt = seq[j].text; break; }
           }
           out.appendChild(makeCard(seq[i].src, txt));
           paired++;
         }
       }
-      setStatus("Trouvé " + paired + " photo(s).");
+      setStatus("Analyse terminée — " + paired + " photo(s).");
       log("✅ pairing terminé: " + paired);
     }catch(err){
       console.error(err); log("❌ handlePaste: " + err.message);
@@ -179,42 +226,38 @@
     }
   }
 
-  function toCsvRow(arr, sep=','){
-    return arr.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(sep);
-  }
+  function toCsvRow(arr, sep=','){ return arr.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(sep); }
+  function getStudentCards(){ return Array.from(document.querySelectorAll('#out .card')); }
 
-  function doExportCsv(){
+  function exportCsv(){
     try{
       log("⬇️ export CSV click");
       const fmt = el('csvFormat').value;
-      const cards = Array.from(document.querySelectorAll('.card'));
+      const cards = getStudentCards();
+      if (!cards.length){ alert('Aucune carte élève. Collez d’abord.'); return; }
       let sep = ',', header = [], rows = [];
 
       if(fmt === 'semicolon-file'){
-        sep = ';';
-        header = ['NOM','Prénom','Fichier'];
-        rows.push(header);
+        sep = ';'; header = ['NOM','Prénom','Fichier']; rows.push(header);
         cards.forEach((c,i)=>{
-          const last = c.querySelector('.last').value.trim();
-          const first = c.querySelector('.first').value.trim();
-          const base = (last.toLocaleUpperCase('fr-FR') + ' ' + first).replace(/[^A-Za-z0-9_\-À-ÖØ-öø-ÿ ]+/g,'').trim().replace(/ +/g,'_');
+          const last = c.querySelector('.last')?.value.trim() || '';
+          const first = c.querySelector('.first')?.value.trim() || '';
+          const base = (last.toLocaleUpperCase('fr-FR') + ' ' + first).replace(/[^A-Za-z0-9_\\-À-ÖØ-öø-ÿ ]+/g,'').trim().replace(/ +/g,'_');
           const fname = (base || ('eleve_'+(i+1))) + '.png';
           rows.push([last, first, fname]);
         });
       } else {
-        sep = ',';
-        header = ['last_name','first_name','image'];
-        rows.push(header);
+        sep = ','; header = ['last_name','first_name','image']; rows.push(header);
         cards.forEach(c=>{
-          const last = c.querySelector('.last').value.trim();
-          const first = c.querySelector('.first').value.trim();
-          const src = c.querySelector('img').src;
+          const last = c.querySelector('.last')?.value.trim() || '';
+          const first = c.querySelector('.first')?.value.trim() || '';
+          const src = c.querySelector('img')?.src || '';
           rows.push([last, first, src]);
         });
       }
 
-      const csv = rows.map(r=>toCsvRow(r, sep)).join('\n');
-      const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+      const csv = rows.map(r=>toCsvRow(r, sep)).join('\\n');
+      const blob = new Blob(['\\ufeff' + csv], {type:'text/csv;charset=utf-8'}); // BOM UTF-8
       const url = URL.createObjectURL(blob);
       const name = (fmt === 'semicolon-file') ? 'trombi_pairs_semicolon.csv' : 'trombi_pairs_dataurl.csv';
       const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
@@ -226,31 +269,44 @@
     }
   }
 
-  async function doExportZip(){
+  async function dataURLFromSrc(src){
+    if(src.startsWith('data:')) return src;
+    const endpoint = PROXY() + "?url=" + encodeURIComponent(new URL(src, location.href).href);
+    const r = await fetchWithTimeout(endpoint, {timeout: 12000});
+    if(!r.ok) throw new Error("proxy " + r.status);
+    const b = await r.blob();
+    return await blobToDataURL(b);
+  }
+
+  async function exportZip(){
     try{
       log("⬇️ export ZIP click");
       const zip = new JSZip();
       const folder = zip.folder("photos");
       const rows = [['NOM','Prénom','Fichier']];
+      const cards = getStudentCards();
+      if (!cards.length){ alert('Aucune carte élève. Collez d’abord.'); return; }
 
-      const cards = Array.from(document.querySelectorAll('.card'));
       for(let i=0;i<cards.length;i++){
         const c = cards[i];
-        const last = c.querySelector('.last').value.trim();
-        const first = c.querySelector('.first').value.trim();
-        let src = c.querySelector('img').src;
-        if(!src.startsWith("data:")) src = await convertSrcToDataURL(src); // sécurité
+        const last = c.querySelector('.last')?.value.trim() || '';
+        const first = c.querySelector('.first')?.value.trim() || '';
+        let src = c.querySelector('img')?.src || '';
 
-        const base = (last.toLocaleUpperCase('fr-FR') + ' ' + first).replace(/[^A-Za-z0-9_\-À-ÖØ-öø-ÿ ]+/g,'').trim().replace(/ +/g,'_');
+        try{ src = await dataURLFromSrc(src); }
+        catch(e){ log("⚠️ Image non récupérée: " + e.message); continue; }
+
+        const base = (last.toLocaleUpperCase('fr-FR') + ' ' + first).replace(/[^A-Za-z0-9_\\-À-ÖØ-öø-ÿ ]+/g,'').trim().replace(/ +/g,'_');
         const fname = (base || ('eleve_'+(i+1))) + '.png';
         rows.push([last, first, 'photos/'+fname]);
 
-        const b64 = (src.split(',')[1]||''); // dataURL -> base64
+        const b64 = (src.split(',')[1]||'');
         folder.file(fname, b64, {base64:true});
       }
 
-      const csv = rows.map(r=>toCsvRow(r, ';')).join('\n');
-      zip.file('pairs.csv', csv);
+      const csv = rows.map(r=>toCsvRow(r, ';')).join('\\n');
+      const csvBlob = new Blob(['\\ufeff' + csv], {type:'text/csv;charset=utf-8'});
+      zip.file('pairs.csv', csvBlob);
 
       const blob = await zip.generateAsync({type:'blob'});
       const url = URL.createObjectURL(blob);
@@ -266,36 +322,30 @@
   function wire(){
     el('paste').addEventListener('paste', handlePaste);
     el('clear').addEventListener('click', ()=>{
-      try{
-        el('paste').innerHTML='Clique ici puis Ctrl/Cmd+V depuis Pronote (ou Excel).';
-        el('out').innerHTML=''; el('logs').textContent=''; setStatus('');
-        log("♻️ réinitialisé");
-      }catch(err){ log("❌ clear: " + err.message); }
+      el('paste').innerHTML='Clique ici puis Ctrl/Cmd+V depuis Pronote (ou Excel).';
+      el('out').innerHTML=''; el('logs').textContent=''; setStatus('');
+      log("♻️ réinitialisé");
     });
-    el('exportCsv').addEventListener('click', doExportCsv);
-    el('exportZip').addEventListener('click', doExportZip);
+    el('exportCsv').addEventListener('click', exportCsv);
+    el('exportZip').addEventListener('click', exportZip);
     el('enforceCase').addEventListener('change', ()=>{
-      try{
-        document.querySelectorAll('.card').forEach(c=>{
-          const lastInput = c.querySelector('.last');
-          const firstInput = c.querySelector('.first');
-          // Repart de la concat NOM + Prénom
-          let parts = splitPronote((lastInput.value + ' ' + firstInput.value).trim());
-          if(el('enforceCase').checked) parts = enforceCase(parts);
-          lastInput.value = parts.last;
-          firstInput.value = parts.first;
-        });
-        log("🔠 règle de casse appliquée");
-      }catch(err){ log("❌ enforceCase: " + err.message); }
+      getStudentCards().forEach(c=>{
+        const lastInput = c.querySelector('.last');
+        const firstInput = c.querySelector('.first');
+        if(!lastInput || !firstInput) return;
+        let parts = splitPronote((lastInput.value + ' ' + firstInput.value).trim());
+        parts = enforceCase(parts);
+        lastInput.value = parts.last;
+        firstInput.value = parts.first;
+      });
+      log("🔠 règle de casse appliquée");
     });
-    log("🟢 événements attachés");
+    log("🟢 événements attachés — Backend: " + BACKEND);
+    setStatus("Backend: " + BACKEND);
   }
 
-  if(document.readyState === 'loading'){
-    document.addEventListener('DOMContentLoaded', wire, {once:true});
-  }else{
-    wire();
-  }
+  if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', wire, {once:true}); }
+  else { wire(); }
 
 })();</script>
 </body>
